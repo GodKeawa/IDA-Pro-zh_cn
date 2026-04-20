@@ -28,6 +28,8 @@ sudo pacman -S --needed base-devel python git
 ## Installation
 
 ```bash
+git clone https://github.com/GodKeawa/IDA-Pro-zh_cn.git
+cd IDA-Pro-zh_cn
 makepkg -sicf
 ```
 
