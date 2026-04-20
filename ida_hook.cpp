@@ -193,7 +193,7 @@ static void record_missing(const char* sourceText) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// QString 构造工具
+// QString 构造工具与解析工具
 // ═══════════════════════════════════════════════════════════════════════════
 static QStringData* get_shared_null() {
     static QStringData* sn = nullptr;
@@ -201,6 +201,36 @@ static QStringData* get_shared_null() {
         sn = (QStringData*)dlsym(RTLD_DEFAULT,
                 "_ZN2QT10QArrayData11shared_nullE");
     return sn;
+}
+
+static std::string qstring_to_utf8(const QString* qs) {
+    if (!qs || !qs->d) return "";
+    QStringData* d = qs->d;
+    if (d->size <= 0) return "";
+    uint16_t* data = (uint16_t*)((char*)d + d->offset);
+    
+    std::string res;
+    for (int i = 0; i < d->size; i++) {
+        uint16_t wc = data[i];
+        if (wc < 0x80) {
+            res += (char)wc;
+        } else if (wc < 0x800) {
+            res += (char)(0xC0 | (wc >> 6));
+            res += (char)(0x80 | (wc & 0x3F));
+        } else if (wc >= 0xD800 && wc < 0xDC00 && i + 1 < d->size) {
+            uint16_t wc2 = data[++i];
+            uint32_t cp = 0x10000 + (((wc & 0x3FF) << 10) | (wc2 & 0x3FF));
+            res += (char)(0xF0 | (cp >> 18));
+            res += (char)(0x80 | ((cp >> 12) & 0x3F));
+            res += (char)(0x80 | ((cp >> 6) & 0x3F));
+            res += (char)(0x80 | (cp & 0x3F));
+        } else {
+            res += (char)(0xE0 | (wc >> 12));
+            res += (char)(0x80 | ((wc >> 6) & 0x3F));
+            res += (char)(0x80 | (wc & 0x3F));
+        }
+    }
+    return res;
 }
 
 static void fill_qstring(QString* out, const char* utf8) {
@@ -253,8 +283,29 @@ static void fill_qstring(QString* out, const char* utf8) {
 typedef void (*qapp_tr_fn)(QString*, const char*, const char*, const char*, int);
 typedef void (*qtrans_fn) (QString*, void*, const char*, const char*, const char*, int);
 
-static qapp_tr_fn g_qapp_tr = nullptr;
-static qtrans_fn  g_qtrans  = nullptr;
+typedef void (*qaction_settext_fn)(void*, const QString*);
+typedef void (*qbtn_settext_fn)(void*, const QString*);
+typedef void (*qlabel_settext_fn)(void*, const QString*);
+typedef void (*qmenu_settitle_fn)(void*, const QString*);
+typedef void (*qwidget_setwndtitle_fn)(void*, const QString*);
+typedef void (*qwidget_settooltip_fn)(void*, const QString*);
+typedef void (*qaction_settooltip_fn)(void*, const QString*);
+typedef void (*qgroupbox_settitle_fn)(void*, const QString*);
+typedef void (*qdockwidget_setwndtitle_fn)(void*, const QString*);
+typedef void (*qtabwidget_settabtext_fn)(void*, int, const QString*);
+
+static qapp_tr_fn             g_qapp_tr          = nullptr;
+static qtrans_fn              g_qtrans           = nullptr;
+
+static qaction_settext_fn     g_qact_settext     = nullptr;
+static qbtn_settext_fn        g_qbtn_settext     = nullptr;
+static qlabel_settext_fn      g_qlabel_settext   = nullptr;
+static qmenu_settitle_fn      g_qmenu_settitle   = nullptr;
+static qwidget_setwndtitle_fn g_qwidget_setwndtitle = nullptr;
+static qwidget_settooltip_fn  g_qwidget_settooltip = nullptr;
+static qaction_settooltip_fn  g_qact_settooltip  = nullptr;
+static qgroupbox_settitle_fn  g_qgrpbox_settitle = nullptr;
+static qtabwidget_settabtext_fn g_qtabwdg_settabtext = nullptr;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Hook 1: QT::QCoreApplication::translate
@@ -312,6 +363,106 @@ void _ZNK2QT11QTranslator9translateEPKcS2_S2_i(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Hook 3~7: 高层 UI 挂钩 (Widget-level setText/setTitle 拦截)
+// ═══════════════════════════════════════════════════════════════════════════
+// 缓存已翻译构建的QString，避免内存泄漏以及重复分配
+static std::mutex g_qstring_cache_mutex;
+static std::unordered_map<std::string, QString> g_qstring_cache;
+
+template<typename OriginalFunc>
+static void ui_hook_template(OriginalFunc orig_fn, void* self, const QString* str) {
+    if (!orig_fn) return;
+    if (!str || !str->d || str->d->size <= 0) {
+        orig_fn(self, str);
+        return;
+    }
+    
+    std::string utf8_text = qstring_to_utf8(str);
+    if (!utf8_text.empty()) {
+        auto& std_tr = get_trans();
+        auto it = std_tr.find(utf8_text);
+        if (it != std_tr.end()) {
+            std::lock_guard<std::mutex> lock(g_qstring_cache_mutex);
+            auto cached = g_qstring_cache.find(utf8_text);
+            if (cached == g_qstring_cache.end()) {
+                QString translated;
+                // 我们在堆上分配这个特殊的QString以保留在缓存中
+                fill_qstring(&translated, it->second.c_str());
+                g_qstring_cache[utf8_text] = translated;
+            }
+            orig_fn(self, &g_qstring_cache[utf8_text]);
+            return;
+        }
+        record_missing(utf8_text.c_str());
+    }
+    orig_fn(self, str);
+}
+
+template<typename OriginalFunc>
+static void ui_hook_template_int(OriginalFunc orig_fn, void* self, int index, const QString* str) {
+    if (!orig_fn) return;
+    if (!str || !str->d || str->d->size <= 0) {
+        orig_fn(self, index, str);
+        return;
+    }
+    
+    std::string utf8_text = qstring_to_utf8(str);
+    if (!utf8_text.empty()) {
+        auto& std_tr = get_trans();
+        auto it = std_tr.find(utf8_text);
+        if (it != std_tr.end()) {
+            std::lock_guard<std::mutex> lock(g_qstring_cache_mutex);
+            auto cached = g_qstring_cache.find(utf8_text);
+            if (cached == g_qstring_cache.end()) {
+                QString translated;
+                fill_qstring(&translated, it->second.c_str());
+                g_qstring_cache[utf8_text] = translated;
+            }
+            orig_fn(self, index, &g_qstring_cache[utf8_text]);
+            return;
+        }
+        record_missing(utf8_text.c_str());
+    }
+    orig_fn(self, index, str);
+}
+
+extern "C" void _ZN2QT7QAction7setTextERKNS_7QStringE(void* self, const QString* str) {
+    ui_hook_template(g_qact_settext, self, str);
+}
+
+extern "C" void _ZN2QT15QAbstractButton7setTextERKNS_7QStringE(void* self, const QString* str) {
+    ui_hook_template(g_qbtn_settext, self, str);
+}
+
+extern "C" void _ZN2QT6QLabel7setTextERKNS_7QStringE(void* self, const QString* str) {
+    ui_hook_template(g_qlabel_settext, self, str);
+}
+
+extern "C" void _ZN2QT5QMenu8setTitleERKNS_7QStringE(void* self, const QString* str) {
+    ui_hook_template(g_qmenu_settitle, self, str);
+}
+
+extern "C" void _ZN2QT7QWidget14setWindowTitleERKNS_7QStringE(void* self, const QString* str) {
+    ui_hook_template(g_qwidget_setwndtitle, self, str);
+}
+
+extern "C" void _ZN2QT7QWidget10setToolTipERKNS_7QStringE(void* self, const QString* str) {
+    ui_hook_template(g_qwidget_settooltip, self, str);
+}
+
+extern "C" void _ZN2QT7QAction10setToolTipERKNS_7QStringE(void* self, const QString* str) {
+    ui_hook_template(g_qact_settooltip, self, str);
+}
+
+extern "C" void _ZN2QT9QGroupBox8setTitleERKNS_7QStringE(void* self, const QString* str) {
+    ui_hook_template(g_qgrpbox_settitle, self, str);
+}
+
+extern "C" void _ZN2QT10QTabWidget10setTabTextEiRKNS_7QStringE(void* self, int index, const QString* str) {
+    ui_hook_template_int(g_qtabwdg_settabtext, self, index, str);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // 生命周期
 // ═══════════════════════════════════════════════════════════════════════════
 __attribute__((constructor))
@@ -320,6 +471,26 @@ static void on_load() {
         "_ZN2QT16QCoreApplication9translateEPKcS2_S2_i");
     g_qtrans  = (qtrans_fn)dlsym(RTLD_NEXT,
         "_ZNK2QT11QTranslator9translateEPKcS2_S2_i");
+
+    g_qact_settext = (qaction_settext_fn)dlsym(RTLD_NEXT,
+        "_ZN2QT7QAction7setTextERKNS_7QStringE");
+    g_qbtn_settext = (qbtn_settext_fn)dlsym(RTLD_NEXT,
+        "_ZN2QT15QAbstractButton7setTextERKNS_7QStringE");
+    g_qlabel_settext = (qlabel_settext_fn)dlsym(RTLD_NEXT,
+        "_ZN2QT6QLabel7setTextERKNS_7QStringE");
+    g_qmenu_settitle = (qmenu_settitle_fn)dlsym(RTLD_NEXT,
+        "_ZN2QT5QMenu8setTitleERKNS_7QStringE");
+    g_qwidget_setwndtitle = (qwidget_setwndtitle_fn)dlsym(RTLD_NEXT,
+        "_ZN2QT7QWidget14setWindowTitleERKNS_7QStringE");
+        
+    g_qwidget_settooltip = (qwidget_settooltip_fn)dlsym(RTLD_NEXT,
+        "_ZN2QT7QWidget10setToolTipERKNS_7QStringE");
+    g_qact_settooltip = (qaction_settooltip_fn)dlsym(RTLD_NEXT,
+        "_ZN2QT7QAction10setToolTipERKNS_7QStringE");
+    g_qgrpbox_settitle = (qgroupbox_settitle_fn)dlsym(RTLD_NEXT,
+        "_ZN2QT9QGroupBox8setTitleERKNS_7QStringE");
+    g_qtabwdg_settabtext = (qtabwidget_settabtext_fn)dlsym(RTLD_NEXT,
+        "_ZN2QT10QTabWidget10setTabTextEiRKNS_7QStringE");
 
     if (!g_qapp_tr) fprintf(stderr, "[ida_lang_hook] WARNING: qapp_tr not found\n");
     if (!g_qtrans)  fprintf(stderr, "[ida_lang_hook] WARNING: qtrans not found\n");
