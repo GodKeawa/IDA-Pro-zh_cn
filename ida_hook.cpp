@@ -294,6 +294,16 @@ typedef void (*qgroupbox_settitle_fn)(void*, const QString*);
 typedef void (*qdockwidget_setwndtitle_fn)(void*, const QString*);
 typedef void (*qtabwidget_settabtext_fn)(void*, int, const QString*);
 
+typedef void (*qmsgbox_settext_fn)(void*, const QString*);
+typedef void* (*qmenu_addaction_fn)(void*, const QString*);
+typedef void* (*qmenubar_addaction_fn)(void*, const QString*);
+typedef void* (*qtoolbar_addaction_fn)(void*, const QString*);
+typedef void (*qlineedit_setplaceholder_fn)(void*, const QString*);
+typedef void (*qtextedit_setplaceholder_fn)(void*, const QString*);
+typedef void (*qcombobox_setitemtext_fn)(void*, int, const QString*);
+typedef void (*qsystray_settooltip_fn)(void*, const QString*);
+typedef void (*qwizard_settitle_fn)(void*, const QString*);
+
 static qapp_tr_fn             g_qapp_tr          = nullptr;
 static qtrans_fn              g_qtrans           = nullptr;
 
@@ -306,6 +316,16 @@ static qwidget_settooltip_fn  g_qwidget_settooltip = nullptr;
 static qaction_settooltip_fn  g_qact_settooltip  = nullptr;
 static qgroupbox_settitle_fn  g_qgrpbox_settitle = nullptr;
 static qtabwidget_settabtext_fn g_qtabwdg_settabtext = nullptr;
+
+static qmsgbox_settext_fn          g_qmsgbox_settext        = nullptr;
+static qmenu_addaction_fn          g_qmenu_addaction        = nullptr;
+static qmenubar_addaction_fn       g_qmenubar_addaction     = nullptr;
+static qtoolbar_addaction_fn       g_qtoolbar_addaction     = nullptr;
+static qlineedit_setplaceholder_fn g_qlineedit_setplaceholder = nullptr;
+static qtextedit_setplaceholder_fn g_qtextedit_setplaceholder = nullptr;
+static qcombobox_setitemtext_fn    g_qcombo_setitemtext     = nullptr;
+static qsystray_settooltip_fn      g_qsystray_settooltip    = nullptr;
+static qwizard_settitle_fn         g_qwizard_settitle       = nullptr;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Hook 1: QT::QCoreApplication::translate
@@ -399,6 +419,32 @@ static void ui_hook_template(OriginalFunc orig_fn, void* self, const QString* st
 }
 
 template<typename OriginalFunc>
+static void* ui_hook_template_ret(OriginalFunc orig_fn, void* self, const QString* str) {
+    if (!orig_fn) return nullptr;
+    if (!str || !str->d || str->d->size <= 0) {
+        return orig_fn(self, str);
+    }
+    
+    std::string utf8_text = qstring_to_utf8(str);
+    if (!utf8_text.empty()) {
+        auto& std_tr = get_trans();
+        auto it = std_tr.find(utf8_text);
+        if (it != std_tr.end()) {
+            std::lock_guard<std::mutex> lock(g_qstring_cache_mutex);
+            auto cached = g_qstring_cache.find(utf8_text);
+            if (cached == g_qstring_cache.end()) {
+                QString translated;
+                fill_qstring(&translated, it->second.c_str());
+                g_qstring_cache[utf8_text] = translated;
+            }
+            return orig_fn(self, &g_qstring_cache[utf8_text]);
+        }
+        record_missing(utf8_text.c_str());
+    }
+    return orig_fn(self, str);
+}
+
+template<typename OriginalFunc>
 static void ui_hook_template_int(OriginalFunc orig_fn, void* self, int index, const QString* str) {
     if (!orig_fn) return;
     if (!str || !str->d || str->d->size <= 0) {
@@ -462,6 +508,42 @@ extern "C" void _ZN2QT10QTabWidget10setTabTextEiRKNS_7QStringE(void* self, int i
     ui_hook_template_int(g_qtabwdg_settabtext, self, index, str);
 }
 
+extern "C" void _ZN2QT11QMessageBox7setTextERKNS_7QStringE(void* self, const QString* str) {
+    ui_hook_template(g_qmsgbox_settext, self, str);
+}
+
+extern "C" void* _ZN2QT5QMenu9addActionERKNS_7QStringE(void* self, const QString* str) {
+    return ui_hook_template_ret(g_qmenu_addaction, self, str);
+}
+
+extern "C" void* _ZN2QT8QMenuBar9addActionERKNS_7QStringE(void* self, const QString* str) {
+    return ui_hook_template_ret(g_qmenubar_addaction, self, str);
+}
+
+extern "C" void* _ZN2QT8QToolBar9addActionERKNS_7QStringE(void* self, const QString* str) {
+    return ui_hook_template_ret(g_qtoolbar_addaction, self, str);
+}
+
+extern "C" void _ZN2QT9QLineEdit18setPlaceholderTextERKNS_7QStringE(void* self, const QString* str) {
+    ui_hook_template(g_qlineedit_setplaceholder, self, str);
+}
+
+extern "C" void _ZN2QT9QTextEdit18setPlaceholderTextERKNS_7QStringE(void* self, const QString* str) {
+    ui_hook_template(g_qtextedit_setplaceholder, self, str);
+}
+
+extern "C" void _ZN2QT9QComboBox11setItemTextEiRKNS_7QStringE(void* self, int index, const QString* str) {
+    ui_hook_template_int(g_qcombo_setitemtext, self, index, str);
+}
+
+extern "C" void _ZN2QT15QSystemTrayIcon10setToolTipERKNS_7QStringE(void* self, const QString* str) {
+    ui_hook_template(g_qsystray_settooltip, self, str);
+}
+
+extern "C" void _ZN2QT11QWizardPage8setTitleERKNS_7QStringE(void* self, const QString* str) {
+    ui_hook_template(g_qwizard_settitle, self, str);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // 生命周期
 // ═══════════════════════════════════════════════════════════════════════════
@@ -491,6 +573,25 @@ static void on_load() {
         "_ZN2QT9QGroupBox8setTitleERKNS_7QStringE");
     g_qtabwdg_settabtext = (qtabwidget_settabtext_fn)dlsym(RTLD_NEXT,
         "_ZN2QT10QTabWidget10setTabTextEiRKNS_7QStringE");
+
+    g_qmsgbox_settext = (qmsgbox_settext_fn)dlsym(RTLD_NEXT,
+        "_ZN2QT11QMessageBox7setTextERKNS_7QStringE");
+    g_qmenu_addaction = (qmenu_addaction_fn)dlsym(RTLD_NEXT,
+        "_ZN2QT5QMenu9addActionERKNS_7QStringE");
+    g_qmenubar_addaction = (qmenubar_addaction_fn)dlsym(RTLD_NEXT,
+        "_ZN2QT8QMenuBar9addActionERKNS_7QStringE");
+    g_qtoolbar_addaction = (qtoolbar_addaction_fn)dlsym(RTLD_NEXT,
+        "_ZN2QT8QToolBar9addActionERKNS_7QStringE");
+    g_qlineedit_setplaceholder = (qlineedit_setplaceholder_fn)dlsym(RTLD_NEXT,
+        "_ZN2QT9QLineEdit18setPlaceholderTextERKNS_7QStringE");
+    g_qtextedit_setplaceholder = (qtextedit_setplaceholder_fn)dlsym(RTLD_NEXT,
+        "_ZN2QT9QTextEdit18setPlaceholderTextERKNS_7QStringE");
+    g_qcombo_setitemtext = (qcombobox_setitemtext_fn)dlsym(RTLD_NEXT,
+        "_ZN2QT9QComboBox11setItemTextEiRKNS_7QStringE");
+    g_qsystray_settooltip = (qsystray_settooltip_fn)dlsym(RTLD_NEXT,
+        "_ZN2QT15QSystemTrayIcon10setToolTipERKNS_7QStringE");
+    g_qwizard_settitle = (qwizard_settitle_fn)dlsym(RTLD_NEXT,
+        "_ZN2QT11QWizardPage8setTitleERKNS_7QStringE");
 
     if (!g_qapp_tr) fprintf(stderr, "[ida_lang_hook] WARNING: qapp_tr not found\n");
     if (!g_qtrans)  fprintf(stderr, "[ida_lang_hook] WARNING: qtrans not found\n");

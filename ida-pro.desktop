@@ -1,7 +1,7 @@
 [Desktop Entry]
 Name=IDA Professional
 Comment=The Interactive Disassembler
-Exec=/opt/ida-pro/ida
+Exec=env LD_LIBRARY_PATH=/opt/ida-pro LD_PRELOAD=/opt/ida-pro/ida_lang_hook.so /opt/ida-pro/ida
 Icon=ida-pro
 Terminal=false
 Type=Application

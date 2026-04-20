@@ -25,12 +25,16 @@ _installer='ida-pro_91_x64linux.run'
 source=("https://archive.org/download/ida-pro_91_x64linux/ida-pro_91_x64linux.run"
 		"${pkgname}.desktop"
 		"${pkgname}-teams.desktop"
-        "keygen3.py")
+        "keygen3.py"
+		"ida_hook.cpp"
+		"ida_lang.txt")
 
 sha256sums=('8ff08022be3a0ef693a9e3ea01010d1356b26cfdcbbe7fdd68d01b3c9700f9e2'
-            '662478dbcb939db8a36f89170246c2187b1086bff840dd96bd4d8f72eac3cad5'
+            '3e6970b1dc768c0a15a974929ec72338068e600253f52bd39cfaf215236b081d'
             '437fc36a8edd8dd6adadd773dd777966797640d93f499892bdd1217afaf1b636'
-            'e778bfca87a658bcb59ed921deb2a1e61370ed5fab514f478ba1d7e0cd308d2a')
+            'e778bfca87a658bcb59ed921deb2a1e61370ed5fab514f478ba1d7e0cd308d2a'
+			'aed88f8cf2198fc5a730dba35e81bf061e07845673f875a17f44954c56c42f82'
+			'd12e5ae5c83382c14f3cc25abb92d50e7b6a9fef684808c5c3a58ae22668da15')
 
 arch=('x86_64')
 
@@ -62,6 +66,10 @@ package() {
 	ln -s /opt/${pkgname}/hvui.png "${pkgdir}"/usr/share/icons/${pkgname}-teams.png
 	ln -s /opt/${pkgname}/license.txt "${pkgdir}"/usr/share/licenses/${pkgname}/LICENSE
 	ln -s /opt/${pkgname}/ida "${pkgdir}"/usr/bin/ida
+
+	# zh_cn
+	g++ -O2 -shared -fPIC -std=c++17 -o "${pkgdir}"/opt/${pkgname}/ida_lang_hook.so "${srcdir}"/ida_hook.cpp -ldl
+	install -Dm644 "${srcdir}"/ida_lang.txt "${pkgdir}"/opt/${pkgname}/ida_lang.txt
 
     # Patch It
     cp "${srcdir}"/keygen3.py "${pkgdir}"/opt/${pkgname}
