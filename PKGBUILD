@@ -1,7 +1,4 @@
 # NOT compatible with AUR helpers!
-#
-# Read README.md from https://gitlab.com/fr0stb1rd/aur-ida-pro
-# Maintainer: patchouli
 
 pkgver=9.1.0
 pkgname="ida-pro"
@@ -9,13 +6,14 @@ pkgrel=1
 pkgdesc="Hex-Rays IDA Pro"
 url="https://www.hex-rays.com/products/ida/${pkgver}/index.shtml"
 license=('custom')
-makedepends=('fakechroot')
+makedepends=('fakechroot' 'gcc')
 depends=('libgl'
 	'libx11'
 	'libxext'
 	'libxrender'
 	'glib2'
 	'qt5-base'
+	'python'
 	'python-rpyc'
 	)
 options=('!strip')
