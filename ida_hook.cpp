@@ -20,34 +20,35 @@
 #include <fstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <set>
 #include <mutex>
 #include <limits.h>
 #include <unistd.h>
 
 // ═══════════════════════════════════════════════════════════════════════════
-// QString ABI (Qt5 x86-64, 从IDA自带libQt5Core反汇编确认)
+// QString ABI (Qt6 x86-64, IDA 9.4)
 //
 // 内存布局:
-//   +0x00  ref              (int)
-//   +0x04  size             (int)       字符数（不含null）
-//   +0x08  alloc            (unsigned)
-//   +0x0C  capacityReserved (unsigned)
-//   +0x10  offset           (ptrdiff_t) data指针 = (char*)d + d->offset
+//   +0x00  d       (QArrayData*)
+//   +0x08  ptr     (char16_t*)
+//   +0x10  size    (qsizetype)
 //
-// 调用约定: translate系列函数使用sret，rdi为隐藏返回值指针，
-//           真正的参数从rsi开始
+// 控件setter只用于不会参与IDA对象查找的文案；菜单文字在绘制时替换。
+// 不拦截Qt全局翻译入口，也不修改QAction/QMenu保存的身份文本。
 // ═══════════════════════════════════════════════════════════════════════════
-struct QStringData {
-    int       ref;
-    int       size;
-    unsigned  alloc;
-    unsigned  capacityReserved;
-    ptrdiff_t offset;
+struct QString {
+    void*     d;
+    uint16_t* ptr;
+    ptrdiff_t size;
 };
 
-struct QString {
-    QStringData* d;
+// Qt6中QRect/QSize均为可按值返回的简单整数聚合体。
+struct QRect {
+    int x1, y1, x2, y2;
+};
+struct QSize {
+    int width, height;
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -65,6 +66,12 @@ static int parse_escape(const char* src, char* dst, int& dlen) {
         case '"':  dst[dlen++] = '"';  return 2;
         default:   dst[dlen++] = src[1]; return 2;
     }
+}
+
+static std::unordered_set<std::string>& known_ui_outputs() {
+    // 堆上保存到进程结束，避免LD_PRELOAD构造/析构顺序影响。
+    static auto* values = new std::unordered_set<std::string>();
+    return *values;
 }
 
 // 从 L"..." 提取内容，返回提取的字符串，pos更新到结束引号之后
@@ -171,6 +178,7 @@ static const std::unordered_map<std::string, std::string>& get_trans() {
         std::string val = extract_lstring(line, pos);
         if (val.empty()) { skipped++; continue; }
         m[key] = val;
+        known_ui_outputs().insert(val);
         count++;
     }
 
@@ -184,10 +192,55 @@ static const std::unordered_map<std::string, std::string>& get_trans() {
 static std::set<std::string>  g_missing;
 static std::mutex             g_missing_mutex;
 
+static bool contains_cjk_utf8(const char* text) {
+    const unsigned char* s = (const unsigned char*)text;
+    for (size_t i = 0; s[i];) {
+        uint32_t cp;
+        if (s[i] < 0x80) { cp = s[i++]; }
+        else if ((s[i] & 0xE0) == 0xC0 && s[i + 1]) {
+            cp = ((s[i] & 0x1F) << 6) | (s[i + 1] & 0x3F); i += 2;
+        } else if ((s[i] & 0xF0) == 0xE0 && s[i + 1] && s[i + 2]) {
+            cp = ((s[i] & 0x0F) << 12) | ((s[i + 1] & 0x3F) << 6) | (s[i + 2] & 0x3F); i += 3;
+        } else if ((s[i] & 0xF8) == 0xF0 && s[i + 1] && s[i + 2] && s[i + 3]) {
+            cp = ((s[i] & 0x07) << 18) | ((s[i + 1] & 0x3F) << 12)
+               | ((s[i + 2] & 0x3F) << 6) | (s[i + 3] & 0x3F); i += 4;
+        } else {
+            i++;
+            continue;
+        }
+        if ((cp >= 0x3400 && cp <= 0x9FFF) || (cp >= 0xF900 && cp <= 0xFAFF))
+            return true;
+    }
+    return false;
+}
+
+static bool is_runtime_noise(const char* text) {
+    if (known_ui_outputs().find(text) != known_ui_outputs().end()) return true;
+    if (contains_cjk_utf8(text)) return true;
+    if (strstr(text, "/home/") != nullptr) return true;
+    const char* prefixes[] = {
+        "IDA - ", "IDA v", "Version ", "Navigator Scale: ", "Disk: ",
+        "Packing the database\n", "Unpacking the database\n",
+    };
+    for (const char* prefix : prefixes)
+        if (strncmp(text, prefix, strlen(prefix)) == 0) return true;
+
+    // 地址、大小和纯数字等会随数据库变化，不应进入可维护词典。
+    bool has_letter = false;
+    for (const unsigned char* p = (const unsigned char*)text; *p; ++p) {
+        if ((*p >= 'G' && *p <= 'Z') || (*p >= 'g' && *p <= 'z')) {
+            has_letter = true;
+            break;
+        }
+    }
+    return !has_letter;
+}
+
 static void record_missing(const char* sourceText) {
     if (!sourceText || sourceText[0] == '\0') return;
     // 过滤纯空白和单字符（太多噪音）
     if (strlen(sourceText) <= 1) return;
+    if (is_runtime_noise(sourceText)) return;
     std::lock_guard<std::mutex> lock(g_missing_mutex);
     g_missing.insert(sourceText);
 }
@@ -195,29 +248,19 @@ static void record_missing(const char* sourceText) {
 // ═══════════════════════════════════════════════════════════════════════════
 // QString 构造工具与解析工具
 // ═══════════════════════════════════════════════════════════════════════════
-static QStringData* get_shared_null() {
-    static QStringData* sn = nullptr;
-    if (!sn)
-        sn = (QStringData*)dlsym(RTLD_DEFAULT,
-                "_ZN2QT10QArrayData11shared_nullE");
-    return sn;
-}
-
 static std::string qstring_to_utf8(const QString* qs) {
-    if (!qs || !qs->d) return "";
-    QStringData* d = qs->d;
-    if (d->size <= 0) return "";
-    uint16_t* data = (uint16_t*)((char*)d + d->offset);
+    if (!qs || !qs->ptr || qs->size <= 0) return "";
+    const uint16_t* data = qs->ptr;
     
     std::string res;
-    for (int i = 0; i < d->size; i++) {
+    for (ptrdiff_t i = 0; i < qs->size; i++) {
         uint16_t wc = data[i];
         if (wc < 0x80) {
             res += (char)wc;
         } else if (wc < 0x800) {
             res += (char)(0xC0 | (wc >> 6));
             res += (char)(0x80 | (wc & 0x3F));
-        } else if (wc >= 0xD800 && wc < 0xDC00 && i + 1 < d->size) {
+        } else if (wc >= 0xD800 && wc < 0xDC00 && i + 1 < qs->size) {
             uint16_t wc2 = data[++i];
             uint32_t cp = 0x10000 + (((wc & 0x3FF) << 10) | (wc2 & 0x3FF));
             res += (char)(0xF0 | (cp >> 18));
@@ -233,7 +276,14 @@ static std::string qstring_to_utf8(const QString* qs) {
     return res;
 }
 
-static void fill_qstring(QString* out, const char* utf8) {
+typedef void (*qstring_utf16_ctor_fn)(QString*, const uint16_t*, ptrdiff_t);
+static qstring_utf16_ctor_fn g_qstring_utf16_ctor = nullptr;
+static void resolve_qt_symbols();
+
+static bool fill_qstring(QString* out, const char* utf8) {
+    resolve_qt_symbols();
+    if (!g_qstring_utf16_ctor) return false;
+
     // UTF-8 -> UTF-16LE
     size_t maxlen = strlen(utf8) * 2 + 2;
     uint16_t* tmp = (uint16_t*)alloca(maxlen * sizeof(uint16_t));
@@ -253,40 +303,16 @@ static void fill_qstring(QString* out, const char* utf8) {
             tmp[j++] = (uint16_t)(0xDC00 | (cp & 0x3FF));
         }
     }
-    int nchars = (int)j;
-
-    // 分配: QStringData header + UTF-16数据 + null终止符
-    // 使用系统malloc（与IDA的Qt内部allocate一致，都调用malloc）
-    size_t header_sz = sizeof(QStringData);
-    size_t data_sz   = (nchars + 1) * sizeof(uint16_t);
-    QStringData* d   = (QStringData*)malloc(header_sz + data_sz);
-    if (!d) {
-        out->d = get_shared_null();
-        return;
-    }
-
-    d->ref              = 1;
-    d->size             = nchars;
-    d->alloc            = (unsigned)nchars;
-    d->capacityReserved = 0;
-    d->offset           = (ptrdiff_t)header_sz;
-
-    uint16_t* data_ptr = (uint16_t*)((char*)d + header_sz);
-    memcpy(data_ptr, tmp, data_sz);
-
-    out->d = d;
+    // 交给IDA自带的Qt6构造QString，避免手工构造其私有引用计数数据。
+    g_qstring_utf16_ctor(out, tmp, (ptrdiff_t)j);
+    return true;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 原始函数指针（sret调用约定）
 // ═══════════════════════════════════════════════════════════════════════════
-typedef void (*qapp_tr_fn)(QString*, const char*, const char*, const char*, int);
-typedef void (*qtrans_fn) (QString*, void*, const char*, const char*, const char*, int);
-
-typedef void (*qaction_settext_fn)(void*, const QString*);
 typedef void (*qbtn_settext_fn)(void*, const QString*);
 typedef void (*qlabel_settext_fn)(void*, const QString*);
-typedef void (*qmenu_settitle_fn)(void*, const QString*);
 typedef void (*qwidget_setwndtitle_fn)(void*, const QString*);
 typedef void (*qwidget_settooltip_fn)(void*, const QString*);
 typedef void (*qaction_settooltip_fn)(void*, const QString*);
@@ -295,22 +321,25 @@ typedef void (*qdockwidget_setwndtitle_fn)(void*, const QString*);
 typedef void (*qtabwidget_settabtext_fn)(void*, int, const QString*);
 
 typedef void (*qmsgbox_settext_fn)(void*, const QString*);
-typedef void* (*qmenu_addaction_fn)(void*, const QString*);
-typedef void* (*qmenubar_addaction_fn)(void*, const QString*);
-typedef void* (*qtoolbar_addaction_fn)(void*, const QString*);
+typedef void (*qpainter_drawtext_rect_fn)(void*, const void*, int, const QString*, void*);
+typedef int (*qfontmetrics_advance_fn)(const void*, const QString*, int);
+typedef QRect (*qfontmetrics_bounding_fn)(const void*, const QString*);
+typedef QRect (*qfontmetrics_bounding_rect_fn)(
+    const void*, const QRect*, int, const QString*, int, int*);
+typedef QSize (*qfontmetrics_size_fn)(const void*, int, const QString*, int, int*);
+typedef void (*qfontmetrics_elided_fn)(
+    QString*, const void*, const QString*, int, int, int);
+typedef void (*qfontmetricsf_elided_fn)(
+    QString*, const void*, const QString*, int, double, int);
 typedef void (*qlineedit_setplaceholder_fn)(void*, const QString*);
 typedef void (*qtextedit_setplaceholder_fn)(void*, const QString*);
 typedef void (*qcombobox_setitemtext_fn)(void*, int, const QString*);
+typedef void (*qstatusbar_showmessage_fn)(void*, const QString*, int);
 typedef void (*qsystray_settooltip_fn)(void*, const QString*);
 typedef void (*qwizard_settitle_fn)(void*, const QString*);
 
-static qapp_tr_fn             g_qapp_tr          = nullptr;
-static qtrans_fn              g_qtrans           = nullptr;
-
-static qaction_settext_fn     g_qact_settext     = nullptr;
 static qbtn_settext_fn        g_qbtn_settext     = nullptr;
 static qlabel_settext_fn      g_qlabel_settext   = nullptr;
-static qmenu_settitle_fn      g_qmenu_settitle   = nullptr;
 static qwidget_setwndtitle_fn g_qwidget_setwndtitle = nullptr;
 static qwidget_settooltip_fn  g_qwidget_settooltip = nullptr;
 static qaction_settooltip_fn  g_qact_settooltip  = nullptr;
@@ -318,81 +347,181 @@ static qgroupbox_settitle_fn  g_qgrpbox_settitle = nullptr;
 static qtabwidget_settabtext_fn g_qtabwdg_settabtext = nullptr;
 
 static qmsgbox_settext_fn          g_qmsgbox_settext        = nullptr;
-static qmenu_addaction_fn          g_qmenu_addaction        = nullptr;
-static qmenubar_addaction_fn       g_qmenubar_addaction     = nullptr;
-static qtoolbar_addaction_fn       g_qtoolbar_addaction     = nullptr;
+static qpainter_drawtext_rect_fn   g_qpainter_drawtext_rect = nullptr;
+static qfontmetrics_advance_fn     g_qfontmetrics_advance = nullptr;
+static qfontmetrics_bounding_fn    g_qfontmetrics_bounding = nullptr;
+static qfontmetrics_bounding_rect_fn g_qfontmetrics_bounding_rect = nullptr;
+static qfontmetrics_size_fn        g_qfontmetrics_size = nullptr;
+static qfontmetrics_elided_fn      g_qfontmetrics_elided = nullptr;
+static qfontmetricsf_elided_fn     g_qfontmetricsf_elided = nullptr;
 static qlineedit_setplaceholder_fn g_qlineedit_setplaceholder = nullptr;
 static qtextedit_setplaceholder_fn g_qtextedit_setplaceholder = nullptr;
 static qcombobox_setitemtext_fn    g_qcombo_setitemtext     = nullptr;
 static qsystray_settooltip_fn      g_qsystray_settooltip    = nullptr;
 static qwizard_settitle_fn         g_qwizard_settitle       = nullptr;
+static qwidget_settooltip_fn       g_qact_seticontext       = nullptr;
+static qwidget_settooltip_fn       g_qact_setstatustip      = nullptr;
+static qwidget_settooltip_fn       g_qact_setwhatsthis      = nullptr;
+static qwidget_settooltip_fn       g_qwidget_setstatustip   = nullptr;
+static qwidget_settooltip_fn       g_qwidget_setwhatsthis   = nullptr;
+static qwidget_settooltip_fn       g_qplaintext_setplaceholder = nullptr;
+static qwidget_settooltip_fn       g_qcommandlink_setdescription = nullptr;
+static qtabwidget_settabtext_fn    g_qtabbar_settabtext     = nullptr;
+static qtabwidget_settabtext_fn    g_qtabbar_settabtooltip  = nullptr;
+static qtabwidget_settabtext_fn    g_qtabbar_settabwhatsthis = nullptr;
+static qtabwidget_settabtext_fn    g_qtoolbox_setitemtext   = nullptr;
+static qtabwidget_settabtext_fn    g_qtoolbox_setitemtooltip = nullptr;
+static qtabwidget_settabtext_fn    g_qfiledialog_setlabeltext = nullptr;
+static qwidget_settooltip_fn       g_qinputdialog_setlabeltext = nullptr;
+static qwidget_settooltip_fn       g_qinputdialog_setoktext = nullptr;
+static qwidget_settooltip_fn       g_qinputdialog_setcanceltext = nullptr;
+static qwidget_settooltip_fn       g_qmsgbox_setinformative = nullptr;
+static qwidget_settooltip_fn       g_qmsgbox_setdetailed    = nullptr;
+static qwidget_settooltip_fn       g_qmsgbox_setwindowtitle = nullptr;
+static qtabwidget_settabtext_fn    g_qmsgbox_setbuttontext  = nullptr;
+static qwidget_settooltip_fn       g_qprogress_setlabeltext = nullptr;
+static qwidget_settooltip_fn       g_qprogress_setcanceltext = nullptr;
+static qwidget_settooltip_fn       g_qwizard_setsubtitle    = nullptr;
+static qtabwidget_settabtext_fn    g_qwizard_setbuttontext  = nullptr;
+static qstatusbar_showmessage_fn   g_qstatusbar_showmessage = nullptr;
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Hook 1: QT::QCoreApplication::translate
-// ═══════════════════════════════════════════════════════════════════════════
-extern "C"
-void _ZN2QT16QCoreApplication9translateEPKcS2_S2_i(
-    QString*    __ret,
-    const char* context,
-    const char* sourceText,
-    const char* disambiguation,
-    int         n)
-{
-    if (sourceText) {
-        auto& m = get_trans();
-        auto  it = m.find(sourceText);
-        if (it != m.end()) {
-            fill_qstring(__ret, it->second.c_str());
-            return;
-        }
-        record_missing(sourceText);
-    }
-    if (g_qapp_tr) {
-        g_qapp_tr(__ret, context, sourceText, disambiguation, n);
-        return;
-    }
-    __ret->d = get_shared_null();
+// 预加载库的构造函数可能早于Qt库初始化；首次真正进入钩子时再解析符号。
+static void resolve_qt_symbols() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        g_qstring_utf16_ctor = (qstring_utf16_ctor_fn)dlsym(RTLD_NEXT,
+            "_ZN2QT7QStringC1EPKNS_5QCharEx");
+        g_qbtn_settext = (qbtn_settext_fn)dlsym(RTLD_NEXT,
+            "_ZN2QT15QAbstractButton7setTextERKNS_7QStringE");
+        g_qlabel_settext = (qlabel_settext_fn)dlsym(RTLD_NEXT,
+            "_ZN2QT6QLabel7setTextERKNS_7QStringE");
+        g_qwidget_setwndtitle = (qwidget_setwndtitle_fn)dlsym(RTLD_NEXT,
+            "_ZN2QT7QWidget14setWindowTitleERKNS_7QStringE");
+        g_qwidget_settooltip = (qwidget_settooltip_fn)dlsym(RTLD_NEXT,
+            "_ZN2QT7QWidget10setToolTipERKNS_7QStringE");
+        g_qact_settooltip = (qaction_settooltip_fn)dlsym(RTLD_NEXT,
+            "_ZN2QT7QAction10setToolTipERKNS_7QStringE");
+        g_qgrpbox_settitle = (qgroupbox_settitle_fn)dlsym(RTLD_NEXT,
+            "_ZN2QT9QGroupBox8setTitleERKNS_7QStringE");
+        g_qtabwdg_settabtext = (qtabwidget_settabtext_fn)dlsym(RTLD_NEXT,
+            "_ZN2QT10QTabWidget10setTabTextEiRKNS_7QStringE");
+        g_qmsgbox_settext = (qmsgbox_settext_fn)dlsym(RTLD_NEXT,
+            "_ZN2QT11QMessageBox7setTextERKNS_7QStringE");
+        g_qpainter_drawtext_rect = (qpainter_drawtext_rect_fn)dlsym(RTLD_NEXT,
+            "_ZN2QT8QPainter8drawTextERKNS_5QRectEiRKNS_7QStringEPS1_");
+        g_qfontmetrics_advance = (qfontmetrics_advance_fn)dlsym(RTLD_NEXT,
+            "_ZNK2QT12QFontMetrics17horizontalAdvanceERKNS_7QStringEi");
+        g_qfontmetrics_bounding = (qfontmetrics_bounding_fn)dlsym(RTLD_NEXT,
+            "_ZNK2QT12QFontMetrics12boundingRectERKNS_7QStringE");
+        g_qfontmetrics_bounding_rect = (qfontmetrics_bounding_rect_fn)dlsym(RTLD_NEXT,
+            "_ZNK2QT12QFontMetrics12boundingRectERKNS_5QRectEiRKNS_7QStringEiPi");
+        g_qfontmetrics_size = (qfontmetrics_size_fn)dlsym(RTLD_NEXT,
+            "_ZNK2QT12QFontMetrics4sizeEiRKNS_7QStringEiPi");
+        g_qfontmetrics_elided = (qfontmetrics_elided_fn)dlsym(RTLD_NEXT,
+            "_ZNK2QT12QFontMetrics10elidedTextERKNS_7QStringENS_2Qt13TextElideModeEii");
+        g_qfontmetricsf_elided = (qfontmetricsf_elided_fn)dlsym(RTLD_NEXT,
+            "_ZNK2QT13QFontMetricsF10elidedTextERKNS_7QStringENS_2Qt13TextElideModeEdi");
+        g_qlineedit_setplaceholder = (qlineedit_setplaceholder_fn)dlsym(RTLD_NEXT,
+            "_ZN2QT9QLineEdit18setPlaceholderTextERKNS_7QStringE");
+        g_qtextedit_setplaceholder = (qtextedit_setplaceholder_fn)dlsym(RTLD_NEXT,
+            "_ZN2QT9QTextEdit18setPlaceholderTextERKNS_7QStringE");
+        g_qcombo_setitemtext = (qcombobox_setitemtext_fn)dlsym(RTLD_NEXT,
+            "_ZN2QT9QComboBox11setItemTextEiRKNS_7QStringE");
+        g_qsystray_settooltip = (qsystray_settooltip_fn)dlsym(RTLD_NEXT,
+            "_ZN2QT15QSystemTrayIcon10setToolTipERKNS_7QStringE");
+        g_qwizard_settitle = (qwizard_settitle_fn)dlsym(RTLD_NEXT,
+            "_ZN2QT11QWizardPage8setTitleERKNS_7QStringE");
+        g_qact_seticontext = (qwidget_settooltip_fn)dlsym(RTLD_NEXT,
+            "_ZN2QT7QAction11setIconTextERKNS_7QStringE");
+        g_qact_setstatustip = (qwidget_settooltip_fn)dlsym(RTLD_NEXT,
+            "_ZN2QT7QAction12setStatusTipERKNS_7QStringE");
+        g_qact_setwhatsthis = (qwidget_settooltip_fn)dlsym(RTLD_NEXT,
+            "_ZN2QT7QAction12setWhatsThisERKNS_7QStringE");
+        g_qwidget_setstatustip = (qwidget_settooltip_fn)dlsym(RTLD_NEXT,
+            "_ZN2QT7QWidget12setStatusTipERKNS_7QStringE");
+        g_qwidget_setwhatsthis = (qwidget_settooltip_fn)dlsym(RTLD_NEXT,
+            "_ZN2QT7QWidget12setWhatsThisERKNS_7QStringE");
+        g_qplaintext_setplaceholder = (qwidget_settooltip_fn)dlsym(RTLD_NEXT,
+            "_ZN2QT14QPlainTextEdit18setPlaceholderTextERKNS_7QStringE");
+        g_qcommandlink_setdescription = (qwidget_settooltip_fn)dlsym(RTLD_NEXT,
+            "_ZN2QT18QCommandLinkButton14setDescriptionERKNS_7QStringE");
+        g_qtabbar_settabtext = (qtabwidget_settabtext_fn)dlsym(RTLD_NEXT,
+            "_ZN2QT7QTabBar10setTabTextEiRKNS_7QStringE");
+        g_qtabbar_settabtooltip = (qtabwidget_settabtext_fn)dlsym(RTLD_NEXT,
+            "_ZN2QT7QTabBar13setTabToolTipEiRKNS_7QStringE");
+        g_qtabbar_settabwhatsthis = (qtabwidget_settabtext_fn)dlsym(RTLD_NEXT,
+            "_ZN2QT7QTabBar15setTabWhatsThisEiRKNS_7QStringE");
+        g_qtoolbox_setitemtext = (qtabwidget_settabtext_fn)dlsym(RTLD_NEXT,
+            "_ZN2QT8QToolBox11setItemTextEiRKNS_7QStringE");
+        g_qtoolbox_setitemtooltip = (qtabwidget_settabtext_fn)dlsym(RTLD_NEXT,
+            "_ZN2QT8QToolBox14setItemToolTipEiRKNS_7QStringE");
+        g_qfiledialog_setlabeltext = (qtabwidget_settabtext_fn)dlsym(RTLD_NEXT,
+            "_ZN2QT11QFileDialog12setLabelTextENS0_11DialogLabelERKNS_7QStringE");
+        g_qinputdialog_setlabeltext = (qwidget_settooltip_fn)dlsym(RTLD_NEXT,
+            "_ZN2QT12QInputDialog12setLabelTextERKNS_7QStringE");
+        g_qinputdialog_setoktext = (qwidget_settooltip_fn)dlsym(RTLD_NEXT,
+            "_ZN2QT12QInputDialog15setOkButtonTextERKNS_7QStringE");
+        g_qinputdialog_setcanceltext = (qwidget_settooltip_fn)dlsym(RTLD_NEXT,
+            "_ZN2QT12QInputDialog19setCancelButtonTextERKNS_7QStringE");
+        g_qmsgbox_setinformative = (qwidget_settooltip_fn)dlsym(RTLD_NEXT,
+            "_ZN2QT11QMessageBox18setInformativeTextERKNS_7QStringE");
+        g_qmsgbox_setdetailed = (qwidget_settooltip_fn)dlsym(RTLD_NEXT,
+            "_ZN2QT11QMessageBox15setDetailedTextERKNS_7QStringE");
+        g_qmsgbox_setwindowtitle = (qwidget_settooltip_fn)dlsym(RTLD_NEXT,
+            "_ZN2QT11QMessageBox14setWindowTitleERKNS_7QStringE");
+        g_qmsgbox_setbuttontext = (qtabwidget_settabtext_fn)dlsym(RTLD_NEXT,
+            "_ZN2QT11QMessageBox13setButtonTextEiRKNS_7QStringE");
+        g_qprogress_setlabeltext = (qwidget_settooltip_fn)dlsym(RTLD_NEXT,
+            "_ZN2QT15QProgressDialog12setLabelTextERKNS_7QStringE");
+        g_qprogress_setcanceltext = (qwidget_settooltip_fn)dlsym(RTLD_NEXT,
+            "_ZN2QT15QProgressDialog19setCancelButtonTextERKNS_7QStringE");
+        g_qwizard_setsubtitle = (qwidget_settooltip_fn)dlsym(RTLD_NEXT,
+            "_ZN2QT11QWizardPage11setSubTitleERKNS_7QStringE");
+        g_qwizard_setbuttontext = (qtabwidget_settabtext_fn)dlsym(RTLD_NEXT,
+            "_ZN2QT11QWizardPage13setButtonTextENS_7QWizard12WizardButtonERKNS_7QStringE");
+        g_qstatusbar_showmessage = (qstatusbar_showmessage_fn)dlsym(RTLD_NEXT,
+            "_ZN2QT10QStatusBar11showMessageERKNS_7QStringEi");
+
+        if (!g_qstring_utf16_ctor)
+            fprintf(stderr, "[ida_lang_hook] WARNING: Qt6 QString constructor not found\n");
+    });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Hook 2: QT::QTranslator::translate (const成员函数，this在sret之后)
-// ═══════════════════════════════════════════════════════════════════════════
-extern "C"
-void _ZNK2QT11QTranslator9translateEPKcS2_S2_i(
-    QString*    __ret,
-    void*       self,
-    const char* context,
-    const char* sourceText,
-    const char* disambiguation,
-    int         n)
-{
-    if (sourceText) {
-        auto& m = get_trans();
-        auto  it = m.find(sourceText);
-        if (it != m.end()) {
-            fill_qstring(__ret, it->second.c_str());
-            return;
-        }
-        record_missing(sourceText);
-    }
-    if (g_qtrans) {
-        g_qtrans(__ret, self, context, sourceText, disambiguation, n);
-        return;
-    }
-    __ret->d = get_shared_null();
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Hook 3~7: 高层 UI 挂钩 (Widget-level setText/setTitle 拦截)
+// 高层 UI 挂钩（控件setter + 菜单绘制层）
 // ═══════════════════════════════════════════════════════════════════════════
 // 缓存已翻译构建的QString，避免内存泄漏以及重复分配
 static std::mutex g_qstring_cache_mutex;
 static std::unordered_map<std::string, QString> g_qstring_cache;
 
+static const QString* translated_for_display(const QString* str) {
+    if (!str || !str->ptr || str->size <= 0) return str;
+
+    std::string utf8_text = qstring_to_utf8(str);
+    if (utf8_text.empty()) return str;
+    auto& std_tr = get_trans();
+    auto it = std_tr.find(utf8_text);
+    if (it == std_tr.end()) {
+        record_missing(utf8_text.c_str());
+        return str;
+    }
+    if (it->second == utf8_text) return str;
+
+    std::lock_guard<std::mutex> lock(g_qstring_cache_mutex);
+    auto cached = g_qstring_cache.find(utf8_text);
+    if (cached == g_qstring_cache.end()) {
+        QString translated;
+        if (fill_qstring(&translated, it->second.c_str()))
+            cached = g_qstring_cache.emplace(utf8_text, translated).first;
+    }
+    return cached == g_qstring_cache.end() ? str : &cached->second;
+}
+
 template<typename OriginalFunc>
-static void ui_hook_template(OriginalFunc orig_fn, void* self, const QString* str) {
+static void ui_hook_template(OriginalFunc& orig_fn, void* self, const QString* str) {
+    resolve_qt_symbols();
     if (!orig_fn) return;
-    if (!str || !str->d || str->d->size <= 0) {
+    if (!str || !str->ptr || str->size <= 0) {
         orig_fn(self, str);
         return;
     }
@@ -402,52 +531,38 @@ static void ui_hook_template(OriginalFunc orig_fn, void* self, const QString* st
         auto& std_tr = get_trans();
         auto it = std_tr.find(utf8_text);
         if (it != std_tr.end()) {
-            std::lock_guard<std::mutex> lock(g_qstring_cache_mutex);
-            auto cached = g_qstring_cache.find(utf8_text);
-            if (cached == g_qstring_cache.end()) {
-                QString translated;
-                // 我们在堆上分配这个特殊的QString以保留在缓存中
-                fill_qstring(&translated, it->second.c_str());
-                g_qstring_cache[utf8_text] = translated;
+            if (it->second == utf8_text) {
+                orig_fn(self, str);
+                return;
             }
-            orig_fn(self, &g_qstring_cache[utf8_text]);
-            return;
-        }
-        record_missing(utf8_text.c_str());
+            const QString* translated_ptr = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(g_qstring_cache_mutex);
+                auto cached = g_qstring_cache.find(utf8_text);
+                if (cached == g_qstring_cache.end()) {
+                    QString translated;
+                    // 保留在缓存中，确保Qt控件复制字符串时数据始终有效。
+                    if (fill_qstring(&translated, it->second.c_str()))
+                        cached = g_qstring_cache.emplace(utf8_text, translated).first;
+                }
+                if (cached != g_qstring_cache.end())
+                    translated_ptr = &cached->second;
+            }
+            // Qt调用可能再次进入本钩子，不能在持有缓存锁时调用。
+            if (translated_ptr) {
+                orig_fn(self, translated_ptr);
+                return;
+            }
+        } else record_missing(utf8_text.c_str());
     }
     orig_fn(self, str);
 }
 
 template<typename OriginalFunc>
-static void* ui_hook_template_ret(OriginalFunc orig_fn, void* self, const QString* str) {
-    if (!orig_fn) return nullptr;
-    if (!str || !str->d || str->d->size <= 0) {
-        return orig_fn(self, str);
-    }
-    
-    std::string utf8_text = qstring_to_utf8(str);
-    if (!utf8_text.empty()) {
-        auto& std_tr = get_trans();
-        auto it = std_tr.find(utf8_text);
-        if (it != std_tr.end()) {
-            std::lock_guard<std::mutex> lock(g_qstring_cache_mutex);
-            auto cached = g_qstring_cache.find(utf8_text);
-            if (cached == g_qstring_cache.end()) {
-                QString translated;
-                fill_qstring(&translated, it->second.c_str());
-                g_qstring_cache[utf8_text] = translated;
-            }
-            return orig_fn(self, &g_qstring_cache[utf8_text]);
-        }
-        record_missing(utf8_text.c_str());
-    }
-    return orig_fn(self, str);
-}
-
-template<typename OriginalFunc>
-static void ui_hook_template_int(OriginalFunc orig_fn, void* self, int index, const QString* str) {
+static void ui_hook_template_int(OriginalFunc& orig_fn, void* self, int index, const QString* str) {
+    resolve_qt_symbols();
     if (!orig_fn) return;
-    if (!str || !str->d || str->d->size <= 0) {
+    if (!str || !str->ptr || str->size <= 0) {
         orig_fn(self, index, str);
         return;
     }
@@ -457,23 +572,68 @@ static void ui_hook_template_int(OriginalFunc orig_fn, void* self, int index, co
         auto& std_tr = get_trans();
         auto it = std_tr.find(utf8_text);
         if (it != std_tr.end()) {
-            std::lock_guard<std::mutex> lock(g_qstring_cache_mutex);
-            auto cached = g_qstring_cache.find(utf8_text);
-            if (cached == g_qstring_cache.end()) {
-                QString translated;
-                fill_qstring(&translated, it->second.c_str());
-                g_qstring_cache[utf8_text] = translated;
+            if (it->second == utf8_text) {
+                orig_fn(self, index, str);
+                return;
             }
-            orig_fn(self, index, &g_qstring_cache[utf8_text]);
-            return;
-        }
-        record_missing(utf8_text.c_str());
+            const QString* translated_ptr = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(g_qstring_cache_mutex);
+                auto cached = g_qstring_cache.find(utf8_text);
+                if (cached == g_qstring_cache.end()) {
+                    QString translated;
+                    if (fill_qstring(&translated, it->second.c_str()))
+                        cached = g_qstring_cache.emplace(utf8_text, translated).first;
+                }
+                if (cached != g_qstring_cache.end())
+                    translated_ptr = &cached->second;
+            }
+            if (translated_ptr) {
+                orig_fn(self, index, translated_ptr);
+                return;
+            }
+        } else record_missing(utf8_text.c_str());
     }
     orig_fn(self, index, str);
 }
 
-extern "C" void _ZN2QT7QAction7setTextERKNS_7QStringE(void* self, const QString* str) {
-    ui_hook_template(g_qact_settext, self, str);
+template<typename OriginalFunc>
+static void ui_hook_template_string_int(OriginalFunc& orig_fn, void* self,
+                                        const QString* str, int value) {
+    resolve_qt_symbols();
+    if (!orig_fn) return;
+    if (!str || !str->ptr || str->size <= 0) {
+        orig_fn(self, str, value);
+        return;
+    }
+
+    std::string utf8_text = qstring_to_utf8(str);
+    if (!utf8_text.empty()) {
+        auto& std_tr = get_trans();
+        auto it = std_tr.find(utf8_text);
+        if (it != std_tr.end()) {
+            if (it->second == utf8_text) {
+                orig_fn(self, str, value);
+                return;
+            }
+            const QString* translated_ptr = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(g_qstring_cache_mutex);
+                auto cached = g_qstring_cache.find(utf8_text);
+                if (cached == g_qstring_cache.end()) {
+                    QString translated;
+                    if (fill_qstring(&translated, it->second.c_str()))
+                        cached = g_qstring_cache.emplace(utf8_text, translated).first;
+                }
+                if (cached != g_qstring_cache.end()) translated_ptr = &cached->second;
+            }
+            if (translated_ptr) {
+                orig_fn(self, translated_ptr, value);
+                return;
+            }
+        } else record_missing(utf8_text.c_str());
+    }
+    orig_fn(self, str, value);
 }
 
 extern "C" void _ZN2QT15QAbstractButton7setTextERKNS_7QStringE(void* self, const QString* str) {
@@ -482,10 +642,6 @@ extern "C" void _ZN2QT15QAbstractButton7setTextERKNS_7QStringE(void* self, const
 
 extern "C" void _ZN2QT6QLabel7setTextERKNS_7QStringE(void* self, const QString* str) {
     ui_hook_template(g_qlabel_settext, self, str);
-}
-
-extern "C" void _ZN2QT5QMenu8setTitleERKNS_7QStringE(void* self, const QString* str) {
-    ui_hook_template(g_qmenu_settitle, self, str);
 }
 
 extern "C" void _ZN2QT7QWidget14setWindowTitleERKNS_7QStringE(void* self, const QString* str) {
@@ -512,16 +668,77 @@ extern "C" void _ZN2QT11QMessageBox7setTextERKNS_7QStringE(void* self, const QSt
     ui_hook_template(g_qmsgbox_settext, self, str);
 }
 
-extern "C" void* _ZN2QT5QMenu9addActionERKNS_7QStringE(void* self, const QString* str) {
-    return ui_hook_template_ret(g_qmenu_addaction, self, str);
+// IDA用QAction/QMenu中保存的英文文本解析"Edit/Comments/..."菜单路径。
+// 因此不能在setText/setTitle/addAction阶段替换它们；QPainter收到的是纯显示
+// 数据，在这里换成译文不会改变菜单对象的属性或后续路径查找结果。
+extern "C" void _ZN2QT8QPainter8drawTextERKNS_5QRectEiRKNS_7QStringEPS1_(
+    void* self, const void* rect, int flags, const QString* str, void* bounding_rect) {
+    resolve_qt_symbols();
+    if (!g_qpainter_drawtext_rect) return;
+    g_qpainter_drawtext_rect(
+        self, rect, flags, translated_for_display(str), bounding_rect);
 }
 
-extern "C" void* _ZN2QT8QMenuBar9addActionERKNS_7QStringE(void* self, const QString* str) {
-    return ui_hook_template_ret(g_qmenubar_addaction, self, str);
+// 菜单尺寸计算发生在绘制之前。若仍按英文原文测量，较长的中文译文会
+// 被挤进英文宽度。字体度量同样使用临时译文，但不回写QAction属性。
+extern "C" int _ZNK2QT12QFontMetrics17horizontalAdvanceERKNS_7QStringEi(
+    const void* self, const QString* str, int length) {
+    resolve_qt_symbols();
+    if (!g_qfontmetrics_advance) return 0;
+    const QString* display = translated_for_display(str);
+    int display_length = display != str && length >= 0 ? (int)display->size : length;
+    return g_qfontmetrics_advance(self, display, display_length);
 }
 
-extern "C" void* _ZN2QT8QToolBar9addActionERKNS_7QStringE(void* self, const QString* str) {
-    return ui_hook_template_ret(g_qtoolbar_addaction, self, str);
+extern "C" QRect _ZNK2QT12QFontMetrics12boundingRectERKNS_7QStringE(
+    const void* self, const QString* str) {
+    resolve_qt_symbols();
+    if (!g_qfontmetrics_bounding) return QRect{0, 0, -1, -1};
+    return g_qfontmetrics_bounding(self, translated_for_display(str));
+}
+
+extern "C" QRect _ZNK2QT12QFontMetrics12boundingRectERKNS_5QRectEiRKNS_7QStringEiPi(
+    const void* self, const QRect* rect, int flags, const QString* str,
+    int tab_stops, int* tab_array) {
+    resolve_qt_symbols();
+    if (!g_qfontmetrics_bounding_rect) return QRect{0, 0, -1, -1};
+    return g_qfontmetrics_bounding_rect(
+        self, rect, flags, translated_for_display(str), tab_stops, tab_array);
+}
+
+extern "C" QSize _ZNK2QT12QFontMetrics4sizeEiRKNS_7QStringEiPi(
+    const void* self, int flags, const QString* str, int tab_stops,
+    int* tab_array) {
+    resolve_qt_symbols();
+    if (!g_qfontmetrics_size) return QSize{-1, -1};
+    return g_qfontmetrics_size(
+        self, flags, translated_for_display(str), tab_stops, tab_array);
+}
+
+// elidedText会生成一个全新的、带省略号的派生字符串。必须在它处理完整
+// 原文之前替换为译文；若等到drawText阶段，词典已无法匹配派生结果。
+extern "C" void _ZNK2QT12QFontMetrics10elidedTextERKNS_7QStringENS_2Qt13TextElideModeEii(
+    QString* out, const void* self, const QString* str, int mode,
+    int width, int flags) {
+    resolve_qt_symbols();
+    if (!g_qfontmetrics_elided) {
+        *out = QString{nullptr, nullptr, 0};
+        return;
+    }
+    g_qfontmetrics_elided(
+        out, self, translated_for_display(str), mode, width, flags);
+}
+
+extern "C" void _ZNK2QT13QFontMetricsF10elidedTextERKNS_7QStringENS_2Qt13TextElideModeEdi(
+    QString* out, const void* self, const QString* str, int mode,
+    double width, int flags) {
+    resolve_qt_symbols();
+    if (!g_qfontmetricsf_elided) {
+        *out = QString{nullptr, nullptr, 0};
+        return;
+    }
+    g_qfontmetricsf_elided(
+        out, self, translated_for_display(str), mode, width, flags);
 }
 
 extern "C" void _ZN2QT9QLineEdit18setPlaceholderTextERKNS_7QStringE(void* self, const QString* str) {
@@ -544,58 +761,90 @@ extern "C" void _ZN2QT11QWizardPage8setTitleERKNS_7QStringE(void* self, const QS
     ui_hook_template(g_qwizard_settitle, self, str);
 }
 
+extern "C" void _ZN2QT7QAction11setIconTextERKNS_7QStringE(void* self, const QString* str) {
+    ui_hook_template(g_qact_seticontext, self, str);
+}
+extern "C" void _ZN2QT7QAction12setStatusTipERKNS_7QStringE(void* self, const QString* str) {
+    ui_hook_template(g_qact_setstatustip, self, str);
+}
+extern "C" void _ZN2QT7QAction12setWhatsThisERKNS_7QStringE(void* self, const QString* str) {
+    ui_hook_template(g_qact_setwhatsthis, self, str);
+}
+extern "C" void _ZN2QT7QWidget12setStatusTipERKNS_7QStringE(void* self, const QString* str) {
+    ui_hook_template(g_qwidget_setstatustip, self, str);
+}
+extern "C" void _ZN2QT7QWidget12setWhatsThisERKNS_7QStringE(void* self, const QString* str) {
+    ui_hook_template(g_qwidget_setwhatsthis, self, str);
+}
+extern "C" void _ZN2QT14QPlainTextEdit18setPlaceholderTextERKNS_7QStringE(void* self, const QString* str) {
+    ui_hook_template(g_qplaintext_setplaceholder, self, str);
+}
+extern "C" void _ZN2QT18QCommandLinkButton14setDescriptionERKNS_7QStringE(void* self, const QString* str) {
+    ui_hook_template(g_qcommandlink_setdescription, self, str);
+}
+extern "C" void _ZN2QT7QTabBar10setTabTextEiRKNS_7QStringE(void* self, int index, const QString* str) {
+    ui_hook_template_int(g_qtabbar_settabtext, self, index, str);
+}
+extern "C" void _ZN2QT7QTabBar13setTabToolTipEiRKNS_7QStringE(void* self, int index, const QString* str) {
+    ui_hook_template_int(g_qtabbar_settabtooltip, self, index, str);
+}
+extern "C" void _ZN2QT7QTabBar15setTabWhatsThisEiRKNS_7QStringE(void* self, int index, const QString* str) {
+    ui_hook_template_int(g_qtabbar_settabwhatsthis, self, index, str);
+}
+extern "C" void _ZN2QT8QToolBox11setItemTextEiRKNS_7QStringE(void* self, int index, const QString* str) {
+    ui_hook_template_int(g_qtoolbox_setitemtext, self, index, str);
+}
+extern "C" void _ZN2QT8QToolBox14setItemToolTipEiRKNS_7QStringE(void* self, int index, const QString* str) {
+    ui_hook_template_int(g_qtoolbox_setitemtooltip, self, index, str);
+}
+extern "C" void _ZN2QT11QFileDialog12setLabelTextENS0_11DialogLabelERKNS_7QStringE(
+    void* self, int label, const QString* str) {
+    ui_hook_template_int(g_qfiledialog_setlabeltext, self, label, str);
+}
+extern "C" void _ZN2QT12QInputDialog12setLabelTextERKNS_7QStringE(void* self, const QString* str) {
+    ui_hook_template(g_qinputdialog_setlabeltext, self, str);
+}
+extern "C" void _ZN2QT12QInputDialog15setOkButtonTextERKNS_7QStringE(void* self, const QString* str) {
+    ui_hook_template(g_qinputdialog_setoktext, self, str);
+}
+extern "C" void _ZN2QT12QInputDialog19setCancelButtonTextERKNS_7QStringE(void* self, const QString* str) {
+    ui_hook_template(g_qinputdialog_setcanceltext, self, str);
+}
+extern "C" void _ZN2QT11QMessageBox18setInformativeTextERKNS_7QStringE(void* self, const QString* str) {
+    ui_hook_template(g_qmsgbox_setinformative, self, str);
+}
+extern "C" void _ZN2QT11QMessageBox15setDetailedTextERKNS_7QStringE(void* self, const QString* str) {
+    ui_hook_template(g_qmsgbox_setdetailed, self, str);
+}
+extern "C" void _ZN2QT11QMessageBox14setWindowTitleERKNS_7QStringE(void* self, const QString* str) {
+    ui_hook_template(g_qmsgbox_setwindowtitle, self, str);
+}
+extern "C" void _ZN2QT11QMessageBox13setButtonTextEiRKNS_7QStringE(void* self, int button, const QString* str) {
+    ui_hook_template_int(g_qmsgbox_setbuttontext, self, button, str);
+}
+extern "C" void _ZN2QT15QProgressDialog12setLabelTextERKNS_7QStringE(void* self, const QString* str) {
+    ui_hook_template(g_qprogress_setlabeltext, self, str);
+}
+extern "C" void _ZN2QT15QProgressDialog19setCancelButtonTextERKNS_7QStringE(void* self, const QString* str) {
+    ui_hook_template(g_qprogress_setcanceltext, self, str);
+}
+extern "C" void _ZN2QT11QWizardPage11setSubTitleERKNS_7QStringE(void* self, const QString* str) {
+    ui_hook_template(g_qwizard_setsubtitle, self, str);
+}
+extern "C" void _ZN2QT11QWizardPage13setButtonTextENS_7QWizard12WizardButtonERKNS_7QStringE(
+    void* self, int button, const QString* str) {
+    ui_hook_template_int(g_qwizard_setbuttontext, self, button, str);
+}
+extern "C" void _ZN2QT10QStatusBar11showMessageERKNS_7QStringEi(
+    void* self, const QString* str, int timeout) {
+    ui_hook_template_string_int(g_qstatusbar_showmessage, self, str, timeout);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // 生命周期
 // ═══════════════════════════════════════════════════════════════════════════
 __attribute__((constructor))
 static void on_load() {
-    g_qapp_tr = (qapp_tr_fn)dlsym(RTLD_NEXT,
-        "_ZN2QT16QCoreApplication9translateEPKcS2_S2_i");
-    g_qtrans  = (qtrans_fn)dlsym(RTLD_NEXT,
-        "_ZNK2QT11QTranslator9translateEPKcS2_S2_i");
-
-    g_qact_settext = (qaction_settext_fn)dlsym(RTLD_NEXT,
-        "_ZN2QT7QAction7setTextERKNS_7QStringE");
-    g_qbtn_settext = (qbtn_settext_fn)dlsym(RTLD_NEXT,
-        "_ZN2QT15QAbstractButton7setTextERKNS_7QStringE");
-    g_qlabel_settext = (qlabel_settext_fn)dlsym(RTLD_NEXT,
-        "_ZN2QT6QLabel7setTextERKNS_7QStringE");
-    g_qmenu_settitle = (qmenu_settitle_fn)dlsym(RTLD_NEXT,
-        "_ZN2QT5QMenu8setTitleERKNS_7QStringE");
-    g_qwidget_setwndtitle = (qwidget_setwndtitle_fn)dlsym(RTLD_NEXT,
-        "_ZN2QT7QWidget14setWindowTitleERKNS_7QStringE");
-        
-    g_qwidget_settooltip = (qwidget_settooltip_fn)dlsym(RTLD_NEXT,
-        "_ZN2QT7QWidget10setToolTipERKNS_7QStringE");
-    g_qact_settooltip = (qaction_settooltip_fn)dlsym(RTLD_NEXT,
-        "_ZN2QT7QAction10setToolTipERKNS_7QStringE");
-    g_qgrpbox_settitle = (qgroupbox_settitle_fn)dlsym(RTLD_NEXT,
-        "_ZN2QT9QGroupBox8setTitleERKNS_7QStringE");
-    g_qtabwdg_settabtext = (qtabwidget_settabtext_fn)dlsym(RTLD_NEXT,
-        "_ZN2QT10QTabWidget10setTabTextEiRKNS_7QStringE");
-
-    g_qmsgbox_settext = (qmsgbox_settext_fn)dlsym(RTLD_NEXT,
-        "_ZN2QT11QMessageBox7setTextERKNS_7QStringE");
-    g_qmenu_addaction = (qmenu_addaction_fn)dlsym(RTLD_NEXT,
-        "_ZN2QT5QMenu9addActionERKNS_7QStringE");
-    g_qmenubar_addaction = (qmenubar_addaction_fn)dlsym(RTLD_NEXT,
-        "_ZN2QT8QMenuBar9addActionERKNS_7QStringE");
-    g_qtoolbar_addaction = (qtoolbar_addaction_fn)dlsym(RTLD_NEXT,
-        "_ZN2QT8QToolBar9addActionERKNS_7QStringE");
-    g_qlineedit_setplaceholder = (qlineedit_setplaceholder_fn)dlsym(RTLD_NEXT,
-        "_ZN2QT9QLineEdit18setPlaceholderTextERKNS_7QStringE");
-    g_qtextedit_setplaceholder = (qtextedit_setplaceholder_fn)dlsym(RTLD_NEXT,
-        "_ZN2QT9QTextEdit18setPlaceholderTextERKNS_7QStringE");
-    g_qcombo_setitemtext = (qcombobox_setitemtext_fn)dlsym(RTLD_NEXT,
-        "_ZN2QT9QComboBox11setItemTextEiRKNS_7QStringE");
-    g_qsystray_settooltip = (qsystray_settooltip_fn)dlsym(RTLD_NEXT,
-        "_ZN2QT15QSystemTrayIcon10setToolTipERKNS_7QStringE");
-    g_qwizard_settitle = (qwizard_settitle_fn)dlsym(RTLD_NEXT,
-        "_ZN2QT11QWizardPage8setTitleERKNS_7QStringE");
-
-    if (!g_qapp_tr) fprintf(stderr, "[ida_lang_hook] WARNING: qapp_tr not found\n");
-    if (!g_qtrans)  fprintf(stderr, "[ida_lang_hook] WARNING: qtrans not found\n");
-
     // 预热翻译表（触发文件加载，打印条目数）
     get_trans();
 }
@@ -618,6 +867,9 @@ static void on_unload() {
         for (char c : s) {
             if (c == '"')  escaped += "\\\"";
             else if (c == '\\') escaped += "\\\\";
+            else if (c == '\n') escaped += "\\n";
+            else if (c == '\r') escaped += "\\r";
+            else if (c == '\t') escaped += "\\t";
             else escaped += c;
         }
         f << "L\"" << escaped << "\",L\"" << escaped << "\",\n";

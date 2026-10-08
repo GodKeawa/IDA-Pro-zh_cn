@@ -1,0 +1,8 @@
+#!/bin/sh
+
+# Keep user-provided search/preload paths while ensuring IDA's bundled Qt and
+# the translation hook take precedence.
+export LD_LIBRARY_PATH="/opt/ida-pro${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+export LD_PRELOAD="/opt/ida-pro/ida_lang_hook.so${LD_PRELOAD:+:${LD_PRELOAD}}"
+
+exec /opt/ida-pro/ida "$@"
